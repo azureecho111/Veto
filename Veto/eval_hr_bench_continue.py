@@ -1,0 +1,299 @@
+import argparse
+import json
+import os
+import sys
+import random
+import time
+from typing import List, Dict, Any
+import base64
+from PIL import Image
+from io import BytesIO
+from tqdm import tqdm
+import re
+import concurrent.futures
+import threading
+
+from base import EchoConfig, EchoForQwen
+from base_qwen3vl import EchoForQwen3
+from datasets import load_dataset
+from openai import OpenAI
+client = OpenAI(base_url="https://yunwu.ai/v1", api_key=os.getenv("JUDGE_API_KEY", "EMPTY"))
+
+
+def extract_choice(text: str, think: bool) -> str:
+    """Extract choice letter A-E from model output."""
+    if not think:
+        patterns = [
+            r"\(([A-E])\)",  # (A)
+            r"\[([A-E])\]",  # [A]
+            r"\b([A-E])\b",  # A as a whole word
+        ]
+        for p in patterns:
+            matches = re.findall(p, text)
+            if matches:
+                return matches[-1].upper()
+        return ""
+    return ""
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Echo Framework Evaluation on V* Benchmark")
+
+    # Dataset Params
+    # parser.add_argument("--data-path", type=str, required=True, help="Path to HR-Bench")
+    # parser.add_argument("--image-root", type=str, required=True, help="Root folder for original images")
+    parser.add_argument("--split", type=str, help="4K / 8K for HR-Bench")
+    parser.add_argument("--output-path", type=str, default="echo_eval_results.jsonl")
+    parser.add_argument("--samples", type=int, default=None, help="Number of random samples to eval")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    # API Params
+    parser.add_argument("--api-url", type=str, default="http://localhost:18903/v1", help="API base URL")
+    parser.add_argument("--api-key", type=str, default="EMPTY", help="API Key")
+    parser.add_argument("--model-name", type=str, default="qwen2.5-vl-7b", help="Model name for reasoning")
+    parser.add_argument("--temperature", type=float, default=0.4)
+    parser.add_argument("--think", action="store_true", help="Response answer directly")
+
+    # Echo Configuration
+    parser.add_argument("--max-steps", type=int, default=15)
+    parser.add_argument("--no-visual-prompt", action="store_false", dest="visual_prompt", help="Disable visual prompt in final crop")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode (save intermediate images)")
+    parser.add_argument("--debug-dir", type=str, default="debug_echo_eval")
+    parser.add_argument("--sample-id", type=str, default=None, help="Evaluate a specific question_id")
+    parser.add_argument("--eval-failed", action="store_true", help="Only evaluate cases where the model failed in hr_bench_vllm_results.jsonl")
+    parser.add_argument("--failed-log-path", type=str, default="../hr_bench_vllm_results.jsonl", help="Path to the previous results file to find failed cases")
+    parser.add_argument("--num-workers", type=int, default=1, help="Number of parallel workers for evaluation")
+    parser.add_argument("--sample-list", type=str, default=None, help="Path to a txt file containing question_ids to evaluate")
+
+    args = parser.parse_args()
+
+    # Create run-specific debug dir if debug is enabled
+    run_timestamp = time.strftime("%Y%m%d_%H%M%S")
+    current_debug_root = os.path.join(args.debug_dir)
+
+    # Initialize Echo Framework
+    config = EchoConfig()
+    config.api_url = args.api_url
+    config.api_key = args.api_key
+    config.model_name = args.model_name
+    config.max_steps = args.max_steps
+    config.debug = args.debug
+    config.visual_prompt = args.visual_prompt
+    config.debug_dir = current_debug_root
+    config.temperature = args.temperature
+    config.seed = args.seed
+
+    # ── 保存 Metadata ──────────────────────────────────────────────────────
+    metadata = {
+        "date": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "mode": "online",
+        "split": args.split,
+        "model_name": args.model_name,
+        "api_url": args.api_url,
+        "temperature": args.temperature,
+        "samples": args.samples,
+        "max_steps": args.max_steps,
+        "think": args.think,
+        "command": "python " + " ".join(sys.argv),
+        "args": vars(args)
+    }
+    os.makedirs(current_debug_root, exist_ok=True)
+    with open(os.path.join(current_debug_root, "metadata.json"), "w", encoding="utf-8") as f_meta:
+        json.dump(metadata, f_meta, indent=4, ensure_ascii=False)
+
+    # 提前创建 trajectories 目录
+    os.makedirs(os.path.join(current_debug_root, "trajectories"), exist_ok=True)
+
+    if "qwen3" in args.model_name:
+        model = EchoForQwen3(config)
+    else:
+        model = EchoForQwen(config)
+
+    # Load data
+    print(f"Loading data from HR-Bench (split:{args.split})")
+    dataset = load_dataset("DreamMr/HR-Bench")[args.split]
+    # Filter or Sample
+    if args.sample_id:
+        print(f"Filtering for sample_id: {args.sample_id}")
+        dataset = [item for item in dataset if str(item.get('index')) == str(args.sample_id)]
+        if not dataset:
+            print(f"Error: Question ID {args.sample_id} not found in {args.data_path}")
+            return
+    elif args.eval_failed:
+        if not os.path.exists(args.failed_log_path):
+            print(f"Error: Failed log file {args.failed_log_path} not found.")
+            return
+        failed_ids = set()
+        with open(args.failed_log_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                res_item = json.loads(line)
+                if not res_item.get('is_correct', True):
+                    failed_ids.add(str(res_item.get('question_id')))
+        
+        print(f"Loaded {len(failed_ids)} failed IDs from {args.failed_log_path}")
+        dataset = [item for item in dataset if str(item.get('index')) in failed_ids]
+        print(f"Filtered dataset to {len(dataset)} failed samples.")
+        
+        if not dataset:
+            print(f"No samples matching the failed IDs were found in the dataset.")
+            return
+            
+    elif args.sample_list:
+        if not os.path.exists(args.sample_list):
+            print(f"Error: Sample list file {args.sample_list} not found.")
+            return
+        with open(args.sample_list, 'r', encoding='utf-8') as f:
+            target_ids = {line.strip() for line in f if line.strip()}
+        print(f"Loaded {len(target_ids)} IDs from {args.sample_list}")
+        dataset = [item for item in dataset if str(item.get('index')) in target_ids]
+        print(f"Filtered dataset to {len(dataset)} matching samples.")
+        
+        if not dataset:
+            print("No matching samples found.")
+            return
+
+    elif args.samples and args.samples < len(dataset):
+        if args.seed:
+            random.seed(args.seed)
+        print(f"Randomly sampling {args.samples} samples...")
+        # dataset = random.sample(dataset, args.samples)
+        dataset = dataset.select(random.sample(range(len(dataset)),args.samples))
+    results = []
+    category_metrics = {}
+    metrics_lock = threading.Lock()
+
+    def load_jsonl(path: str) -> dict:
+        """读取 jsonl，返回 {question_id: is_correct} 字典。"""
+        results = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                results.append(item)
+                # results[qid] = bool(item.get("is_correct", False))
+        return results
+
+    results = load_jsonl(os.path.join(args.debug_dir, "echo_results.jsonl"))
+
+    already = [i['question_id'] for i in results]
+    _index = [i for i in range(800) if str(i) not in already]
+    dataset = dataset.select(_index)
+    def process_item(item):
+        image_base64 = item['image']
+        if not image_base64:
+            # print(f"Warning: Image {image_base64} not found.")
+            return None
+
+        try:
+            # print(image_base64)
+            img = Image.open(BytesIO(base64.b64decode(image_base64))).convert("RGB")
+            sample_id = str(item.get('index', str(random.randint(0, 1000000))))
+
+            # 每个样本拥有独立的 debug 路径（在 run_xxx/ 目录下）
+            trajectories_dir = os.path.join(current_debug_root, "trajectories")
+            local_debug_dir = os.path.join(trajectories_dir, sample_id)
+            if not os.path.exists(local_debug_dir):
+                os.makedirs(local_debug_dir, exist_ok=True)
+
+            question = item['question'] + "\n" + f"A.{item['A']}\nB.{item['B']}\nC.{item['C']}\nD.{item['D']}"
+
+            if not args.think:
+                question += "\n Please answer with the option's letter from the given choices directly."
+            # 调用更新后的 thread-safe generate 方法
+            response_text = model.generate(img, question, custom_debug_dir=local_debug_dir)
+            metadata = {}
+            if not args.think:
+                choice = extract_choice(response_text, args.think)
+                is_correct = (choice == item['answer'])
+            else:
+                prompt = f"""You are an objective evaluator.
+                Analyze the following multiple-choice question, the correct answer (ground truth), and a model's prediction (which might include reasoning).
+                Decide if the model's final conclusion matches the ground truth.
+
+                # Question: {question}
+                Ground Truth Choice: {item['answer']}
+                Model Prediction: {response_text}
+
+                Based ONLY on the final choice letter made by the model (ignore the difference in content of the choice, only judge whether the model choose the correct letter A/B/C/D), is it correct? 
+                Respond with exactly one word: 'YES' if correct, 'NO' if incorrect."""
+
+
+                res = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "system", "content": "You are a helpful assistant."},
+                              {"role": "user", "content": prompt}],
+                    temperature=0.0
+                )
+                ans = res.choices[0].message.content.strip()
+                # print(ans)
+                choice = "###"
+                is_correct = "yes" in ans.lower()
+
+            print(f"########## Sample {sample_id} | Choice: {choice} | GT: {item['answer']} | Correct: {is_correct}")
+
+            res_item = {
+                "image": "..",
+                "text": question,
+                "category": item['category'],
+                "question_id": sample_id,
+                "label": item['answer'],
+                "echo_prediction": response_text,
+                "processed_choice": choice,
+                "is_correct": is_correct,
+                "debug_path": os.path.abspath(local_debug_dir),
+                "targets": metadata.get("targets", []),
+                "found_targets": metadata.get("found_targets", []),
+                "all_found": metadata.get("all_found", False)
+            }
+
+            with metrics_lock:
+                cat = item.get('category', 'unknown')
+                if cat not in category_metrics:
+                    category_metrics[cat] = {"correct": 0, "total": 0}
+                category_metrics[cat]["total"] += 1
+                if is_correct:
+                    category_metrics[cat]["correct"] += 1
+                
+                results.append(res_item)
+                # 增量保存结果
+                with open(os.path.join(current_debug_root,args.output_path), 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(res_item, ensure_ascii=False) + "\n")
+            
+            return res_item
+        except Exception as e:
+            print(f"Error processing sample {item.get('index')}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    print(f"Starting Parallel Echo evaluation with {args.num_workers} workers...")
+    # 用线程池并行执行
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+        futures = [executor.submit(process_item, item) for item in dataset]
+        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
+            pass
+
+    # Summary Report
+    print("\n" + "=" * 50)
+    print("ECHO FRAMEWORK EVALUATION REPORT")
+    print("=" * 50)
+    total_correct = 0
+    total_samples = 0
+
+    for cat, stats in category_metrics.items():
+        acc = stats["correct"] / stats["total"] * 100
+        print(f"{cat:<25}: {acc:6.2f}% ({stats['correct']}/{stats['total']})")
+        total_correct += stats["correct"]
+        total_samples += stats["total"]
+
+    if total_samples > 0:
+        overall_acc = total_correct / total_samples * 100
+        print("-" * 50)
+        print(f"{'OVERALL':<25}: {overall_acc:6.2f}% ({total_correct}/{total_samples})")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    main()

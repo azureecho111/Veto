@@ -1,0 +1,4 @@
+python eval_hr_bench.py --split hrbench_4k --samples 800 --output-path echo_results.jsonl --num-workers 12 --model-name qwen2.5-vl-7b --temperature 0.4 --no-visual-prompt
+python eval_hr_bench.py --split hrbench_8k --samples 800 --output-path echo_results.jsonl --num-workers 12 --model-name qwen2.5-vl-7b --temperature 0.4 --no-visual-prompt
+python eval_hr_bench.py --split hrbench_4k --samples 800 --output-path echo_results.jsonl --num-workers 12 --model-name qwen2.5-vl-7b --temperature 0.4
+python eval_hr_bench.py --split hrbench_8k --samples 800 --output-path echo_results.jsonl --num-workers 12 --model-name qwen2.5-vl-7b --temperature 0.4
