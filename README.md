@@ -8,6 +8,12 @@
 
 [[Paper](https://doi.org/10.1145/3767308.3836245)] [[Code](https://github.com/azureecho111/Veto)] [[Citation](#citation)]
 
+<p align="center">
+  <img src="assets/figures/veto-teaser.png" alt="Comparison between an existing visual reasoning method and Veto" width="100%">
+</p>
+
+<p align="center"><em>Figure 1. Veto filters low-probability regions instead of exhaustively searching the full image.</em></p>
+
 ## Overview
 
 Vision-language models often struggle when a question depends on a small detail in a high-resolution or cluttered image. Instead of exhaustively searching every region, Veto follows a human-inspired **negative filtering** process: it verifies visible targets, identifies regions unlikely to contain the remaining targets, and iteratively simplifies the visual input before producing an answer.
@@ -22,6 +28,12 @@ Veto is training-free, uses no external vision expert, and works with OpenAI-com
 4. **Answer generation.** Once all targets are grounded or the iteration budget is reached, Veto answers using the resulting visual evidence.
 
 The two-stage VVG + RDNF design reduces the risk of accepting hallucinated targets while avoiding expensive exhaustive visual search.
+
+<p align="center">
+  <img src="assets/figures/veto-pipeline.png" alt="Veto pipeline with preprocessing, verifiable visual grounding, reasoning-driven negative filtering, and post-processing" width="100%">
+</p>
+
+<p align="center"><em>Figure 2. Veto alternates between verifiable visual grounding and reasoning-driven negative filtering until it can answer from reliable visual evidence.</em></p>
 
 ## Main Results
 
